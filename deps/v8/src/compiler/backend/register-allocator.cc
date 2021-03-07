@@ -2650,7 +2650,7 @@ bool LiveRangeBundle::TryAddRange(LiveRange* range) {
 LiveRangeBundle* LiveRangeBundle::TryMerge(LiveRangeBundle* lhs,
                                            LiveRangeBundle* rhs,
                                            bool trace_alloc) {
-  if (rhs == lhs) return nullptr;
+  if (rhs == lhs) return lhs;
 
   auto iter1 = lhs->uses_.begin();
   auto iter2 = rhs->uses_.begin();
@@ -4519,9 +4519,11 @@ void OperandAssigner::AssignSpillSlots() {
   for (SpillRange* range : spill_ranges) {
     data()->tick_counter()->TickAndMaybeEnterSafepoint();
     if (range == nullptr || range->IsEmpty()) continue;
-    // Allocate a new operand referring to the spill slot.
     if (!range->HasSlot()) {
-      int index = data()->frame()->AllocateSpillSlot(range->byte_width());
+      // Allocate a new operand referring to the spill slot, aligned to the
+      // operand size.
+      int width = range->byte_width();
+      int index = data()->frame()->AllocateSpillSlot(width, width);
       range->set_assigned_slot(index);
     }
   }

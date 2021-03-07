@@ -58,11 +58,15 @@ constexpr RegList kLiftoffAssemblerFpCacheRegs = LowDwVfpRegister::ListOf(
 
 #elif V8_TARGET_ARCH_ARM64
 
-// x16: ip0, x17: ip1, x18: platform register, x26: root, x27: cp, x29: fp,
-// x30: lr, x31: xzr.
+// x16: ip0, x17: ip1, x18: platform register, x26: root, x27: cp, x8: base,
+// x29: fp, x30: lr, x31: xzr.
 constexpr RegList kLiftoffAssemblerGpCacheRegs =
     CPURegister::ListOf(x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12,
+#ifdef V8_COMPRESS_POINTERS_IN_SHARED_CAGE
+                        x13, x14, x15, x19, x20, x21, x22, x23, x24, x25);
+#else
                         x13, x14, x15, x19, x20, x21, x22, x23, x24, x25, x28);
+#endif
 
 // d15: fp_zero, d30-d31: macro-assembler scratch V Registers.
 constexpr RegList kLiftoffAssemblerFpCacheRegs = CPURegister::ListOf(
@@ -77,6 +81,26 @@ constexpr RegList kLiftoffAssemblerGpCacheRegs =
 constexpr RegList kLiftoffAssemblerFpCacheRegs = DoubleRegister::ListOf(
     d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12);
 
+#elif V8_TARGET_ARCH_PPC64
+
+constexpr RegList kLiftoffAssemblerGpCacheRegs =
+    Register::ListOf(r3, r4, r5, r6, r7, r8, r9, r10, r11);
+
+constexpr RegList kLiftoffAssemblerFpCacheRegs = DoubleRegister::ListOf(
+    d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12);
+
+#elif V8_TARGET_ARCH_RISCV64
+
+// Any change of kLiftoffAssemblerGpCacheRegs also need to update
+// kPushedGpRegs in frame-constants-riscv64.h
+constexpr RegList kLiftoffAssemblerGpCacheRegs =
+    Register::ListOf(a0, a1, a2, a3, a4, a5, a6, a7, t0, t1, t2, s7);
+
+// Any change of kLiftoffAssemblerGpCacheRegs also need to update
+// kPushedFpRegs in frame-constants-riscv64.h
+constexpr RegList kLiftoffAssemblerFpCacheRegs =
+    DoubleRegister::ListOf(ft0, ft1, ft2, ft3, ft4, ft5, ft6, ft7, fa0, fa1,
+                           fa2, fa3, fa4, fa5, fa6, fa7, ft8, ft9, ft10, ft11);
 #else
 
 constexpr RegList kLiftoffAssemblerGpCacheRegs = 0xff;
@@ -84,7 +108,6 @@ constexpr RegList kLiftoffAssemblerGpCacheRegs = 0xff;
 constexpr RegList kLiftoffAssemblerFpCacheRegs = 0xff;
 
 #endif
-
 }  // namespace wasm
 }  // namespace internal
 }  // namespace v8

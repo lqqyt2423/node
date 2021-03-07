@@ -1326,6 +1326,15 @@ void Simulator::SetCR0(intptr_t result, bool setSO) {
   condition_reg_ = (condition_reg_ & ~0xF0000000) | bf;
 }
 
+void Simulator::SetCR6(bool true_for_all, bool false_for_all) {
+  int32_t clear_cr6_mask = 0xFFFFFF0F;
+  if (true_for_all) {
+    condition_reg_ = (condition_reg_ & clear_cr6_mask) | 0x80;
+  } else if (false_for_all) {
+    condition_reg_ = (condition_reg_ & clear_cr6_mask) | 0x20;
+  }
+}
+
 void Simulator::ExecuteBranchConditional(Instruction* instr, BCType type) {
   int bo = instr->Bits(25, 21) << 21;
   int condition_bit = instr->Bits(20, 16);
@@ -1375,6 +1384,36 @@ void Simulator::ExecuteBranchConditional(Instruction* instr, BCType type) {
 
   if (instr->Bit(0) == 1) {  // LK flag set
     special_reg_lr_ = old_pc + 4;
+  }
+}
+
+// Vector instruction helpers.
+#define DECODE_VX_INSTRUCTION(d, a, b, source_or_target) \
+  int d = instr->R##source_or_target##Value();           \
+  int a = instr->RAValue();                              \
+  int b = instr->RBValue();
+#define FOR_EACH_LANE(i, type) \
+  for (uint32_t i = 0; i < kSimd128Size / sizeof(type); i++)
+template <typename A, typename T, typename Operation>
+void VectorCompareOp(Simulator* sim, Instruction* instr, bool is_fp,
+                     Operation op) {
+  DECODE_VX_INSTRUCTION(t, a, b, T)
+  bool true_for_all = true, false_for_all = true;
+  FOR_EACH_LANE(i, A) {
+    A a_val = sim->get_simd_register_by_lane<A>(a, i);
+    A b_val = sim->get_simd_register_by_lane<A>(b, i);
+    T t_val = 0;
+    bool is_not_nan = is_fp ? !isnan(a_val) && !isnan(b_val) : true;
+    if (is_not_nan && op(a_val, b_val)) {
+      false_for_all = false;
+      t_val = -1;  // Set all bits to 1 indicating true.
+    } else {
+      true_for_all = false;
+    }
+    sim->set_simd_register_by_lane<T>(t, i, t_val);
+  }
+  if (instr->Bit(10)) {  // RC bit set.
+    sim->SetCR6(true_for_all, false_for_all);
   }
 }
 
@@ -2297,10 +2336,17 @@ void Simulator::ExecuteGeneric(Instruction* instr) {
       break;
     }
     case MFVSRD: {
-      DCHECK(!instr->Bit(0));
       int frt = instr->RTValue();
       int ra = instr->RAValue();
-      int64_t frt_val = get_d_register(frt);
+      int64_t frt_val;
+      if (!instr->Bit(0)) {
+        // if double reg (TX=0).
+        frt_val = get_d_register(frt);
+      } else {
+        // if simd reg (TX=1).
+        DCHECK_EQ(instr->Bit(0), 1);
+        frt_val = get_simd_register_by_lane<int64_t>(frt, 0);
+      }
       set_register(ra, frt_val);
       break;
     }
@@ -2313,11 +2359,18 @@ void Simulator::ExecuteGeneric(Instruction* instr) {
       break;
     }
     case MTVSRD: {
-      DCHECK(!instr->Bit(0));
       int frt = instr->RTValue();
       int ra = instr->RAValue();
       int64_t ra_val = get_register(ra);
-      set_d_register(frt, ra_val);
+      if (!instr->Bit(0)) {
+        // if double reg (TX=0).
+        set_d_register(frt, ra_val);
+      } else {
+        // if simd reg (TX=1).
+        DCHECK_EQ(instr->Bit(0), 1);
+        set_simd_register_by_lane<int64_t>(frt, 0,
+                                           static_cast<int64_t>(ra_val));
+      }
       break;
     }
     case MTVSRWA: {
@@ -3712,7 +3765,401 @@ void Simulator::ExecuteGeneric(Instruction* instr) {
       set_d_register_from_double(frt, frt_val);
       return;
     }
-
+    // Vector instructions.
+    case STVX: {
+      DECODE_VX_INSTRUCTION(vrs, ra, rb, S)
+      intptr_t ra_val = ra == 0 ? 0 : get_register(ra);
+      intptr_t rb_val = get_register(rb);
+      __int128 vrs_val =
+          *(reinterpret_cast<__int128*>(get_simd_register(vrs).int8));
+      WriteQW((ra_val + rb_val) & 0xFFFFFFFFFFFFFFF0, vrs_val);
+      break;
+    }
+    case LXVD: {
+      DECODE_VX_INSTRUCTION(xt, ra, rb, T)
+      intptr_t ra_val = ra == 0 ? 0 : get_register(ra);
+      intptr_t rb_val = get_register(rb);
+      set_simd_register_by_lane<int64_t>(xt, 0, ReadDW(ra_val + rb_val));
+      set_simd_register_by_lane<int64_t>(
+          xt, 1, ReadDW(ra_val + rb_val + kSystemPointerSize));
+      break;
+    }
+    case STXVD: {
+      DECODE_VX_INSTRUCTION(xs, ra, rb, S)
+      intptr_t ra_val = ra == 0 ? 0 : get_register(ra);
+      intptr_t rb_val = get_register(rb);
+      WriteDW(ra_val + rb_val, get_simd_register_by_lane<int64_t>(xs, 0));
+      WriteDW(ra_val + rb_val + kSystemPointerSize,
+              get_simd_register_by_lane<int64_t>(xs, 1));
+      break;
+    }
+#define VSPLT(type)                                       \
+  uint32_t uim = instr->Bits(20, 16);                     \
+  int vrt = instr->RTValue();                             \
+  int vrb = instr->RBValue();                             \
+  type value = get_simd_register_by_lane<type>(vrb, uim); \
+  FOR_EACH_LANE(i, type) { set_simd_register_by_lane<type>(vrt, i, value); }
+    case VSPLTW: {
+      VSPLT(int32_t)
+      break;
+    }
+    case VSPLTH: {
+      VSPLT(int16_t)
+      break;
+    }
+    case VSPLTB: {
+      VSPLT(int8_t)
+      break;
+    }
+#undef VSPLT
+#define VINSERT(type, element)                                              \
+  uint32_t uim = static_cast<uint32_t>(instr->Bits(20, 16)) / sizeof(type); \
+  int vrt = instr->RTValue();                                               \
+  int vrb = instr->RBValue();                                               \
+  set_simd_register_by_lane<type>(                                          \
+      vrt, uim, get_simd_register_by_lane<type>(vrb, element));
+    case VINSERTD: {
+      VINSERT(int64_t, 0)
+      break;
+    }
+    case VINSERTW: {
+      VINSERT(int32_t, 1)
+      break;
+    }
+    case VINSERTH: {
+      VINSERT(int16_t, 3)
+      break;
+    }
+    case VINSERTB: {
+      VINSERT(int8_t, 7)
+      break;
+    }
+#undef VINSERT
+#define VEXTRACT(type, element)                                             \
+  uint32_t uim = static_cast<uint32_t>(instr->Bits(20, 16)) / sizeof(type); \
+  int vrt = instr->RTValue();                                               \
+  int vrb = instr->RBValue();                                               \
+  type val = get_simd_register_by_lane<type>(vrb, uim);                     \
+  set_simd_register_by_lane<uint64_t>(vrt, 0, 0);                           \
+  set_simd_register_by_lane<uint64_t>(vrt, 1, 0);                           \
+  set_simd_register_by_lane<type>(vrt, element, val);
+    case VEXTRACTD: {
+      VEXTRACT(uint64_t, 0)
+      break;
+    }
+    case VEXTRACTUW: {
+      VEXTRACT(uint32_t, 1)
+      break;
+    }
+    case VEXTRACTUH: {
+      VEXTRACT(uint16_t, 3)
+      break;
+    }
+    case VEXTRACTUB: {
+      VEXTRACT(uint8_t, 7)
+      break;
+    }
+#undef VEXTRACT
+#define VECTOR_LOGICAL_OP(expr)                               \
+  DECODE_VX_INSTRUCTION(t, a, b, T)                           \
+  FOR_EACH_LANE(i, int64_t) {                                 \
+    int64_t a_val = get_simd_register_by_lane<int64_t>(a, i); \
+    int64_t b_val = get_simd_register_by_lane<int64_t>(b, i); \
+    set_simd_register_by_lane<int64_t>(t, i, expr);           \
+  }
+    case VAND: {
+      VECTOR_LOGICAL_OP(a_val & b_val)
+      break;
+    }
+    case VOR: {
+      VECTOR_LOGICAL_OP(a_val | b_val)
+      break;
+    }
+    case VNOR: {
+      VECTOR_LOGICAL_OP(~(a_val | b_val))
+      break;
+    }
+    case VXOR: {
+      VECTOR_LOGICAL_OP(a_val ^ b_val)
+      break;
+    }
+#undef VECTOR_LOGICAL_OP
+#define VECTOR_ARITHMETIC_OP(type, op)                 \
+  DECODE_VX_INSTRUCTION(t, a, b, T)                    \
+  FOR_EACH_LANE(i, type) {                             \
+    set_simd_register_by_lane<type>(                   \
+        t, i,                                          \
+        get_simd_register_by_lane<type>(a, i)          \
+            op get_simd_register_by_lane<type>(b, i)); \
+  }
+    case XVADDDP: {
+      VECTOR_ARITHMETIC_OP(double, +)
+      break;
+    }
+    case XVSUBDP: {
+      VECTOR_ARITHMETIC_OP(double, -)
+      break;
+    }
+    case XVMULDP: {
+      VECTOR_ARITHMETIC_OP(double, *)
+      break;
+    }
+    case VADDFP: {
+      VECTOR_ARITHMETIC_OP(float, +)
+      break;
+    }
+    case VSUBFP: {
+      VECTOR_ARITHMETIC_OP(float, -)
+      break;
+    }
+    case XVMULSP: {
+      VECTOR_ARITHMETIC_OP(float, *)
+      break;
+    }
+    case VADDUDM: {
+      VECTOR_ARITHMETIC_OP(int64_t, +)
+      break;
+    }
+    case VSUBUDM: {
+      VECTOR_ARITHMETIC_OP(int64_t, -)
+      break;
+    }
+    case VADDUWM: {
+      VECTOR_ARITHMETIC_OP(int32_t, +)
+      break;
+    }
+    case VSUBUWM: {
+      VECTOR_ARITHMETIC_OP(int32_t, -)
+      break;
+    }
+    case VMULUWM: {
+      VECTOR_ARITHMETIC_OP(int32_t, *)
+      break;
+    }
+    case VADDUHM: {
+      VECTOR_ARITHMETIC_OP(int16_t, +)
+      break;
+    }
+    case VSUBUHM: {
+      VECTOR_ARITHMETIC_OP(int16_t, -)
+      break;
+    }
+    case VADDUBM: {
+      VECTOR_ARITHMETIC_OP(int8_t, +)
+      break;
+    }
+    case VSUBUBM: {
+      VECTOR_ARITHMETIC_OP(int8_t, -)
+      break;
+    }
+#undef VECTOR_ARITHMETIC_OP
+#define VECTOR_MIN_MAX_OP(type, op)                                        \
+  DECODE_VX_INSTRUCTION(t, a, b, T)                                        \
+  FOR_EACH_LANE(i, type) {                                                 \
+    type a_val = get_simd_register_by_lane<type>(a, i);                    \
+    type b_val = get_simd_register_by_lane<type>(b, i);                    \
+    set_simd_register_by_lane<type>(t, i, a_val op b_val ? a_val : b_val); \
+  }
+    case VMINSD: {
+      VECTOR_MIN_MAX_OP(int64_t, <)
+      break;
+    }
+    case VMINUD: {
+      VECTOR_MIN_MAX_OP(uint64_t, <)
+      break;
+    }
+    case VMINSW: {
+      VECTOR_MIN_MAX_OP(int32_t, <)
+      break;
+    }
+    case VMINUW: {
+      VECTOR_MIN_MAX_OP(uint32_t, <)
+      break;
+    }
+    case VMINSH: {
+      VECTOR_MIN_MAX_OP(int16_t, <)
+      break;
+    }
+    case VMINUH: {
+      VECTOR_MIN_MAX_OP(uint16_t, <)
+      break;
+    }
+    case VMINSB: {
+      VECTOR_MIN_MAX_OP(int8_t, <)
+      break;
+    }
+    case VMINUB: {
+      VECTOR_MIN_MAX_OP(uint8_t, <)
+      break;
+    }
+    case VMAXSD: {
+      VECTOR_MIN_MAX_OP(int64_t, >)
+      break;
+    }
+    case VMAXUD: {
+      VECTOR_MIN_MAX_OP(uint64_t, >)
+      break;
+    }
+    case VMAXSW: {
+      VECTOR_MIN_MAX_OP(int32_t, >)
+      break;
+    }
+    case VMAXUW: {
+      VECTOR_MIN_MAX_OP(uint32_t, >)
+      break;
+    }
+    case VMAXSH: {
+      VECTOR_MIN_MAX_OP(int16_t, >)
+      break;
+    }
+    case VMAXUH: {
+      VECTOR_MIN_MAX_OP(uint16_t, >)
+      break;
+    }
+    case VMAXSB: {
+      VECTOR_MIN_MAX_OP(int8_t, >)
+      break;
+    }
+    case VMAXUB: {
+      VECTOR_MIN_MAX_OP(uint8_t, >)
+      break;
+    }
+#undef VECTOR_MIN_MAX_OP
+#define VECTOR_SHIFT_OP(type, op, mask)                        \
+  DECODE_VX_INSTRUCTION(t, a, b, T)                            \
+  FOR_EACH_LANE(i, type) {                                     \
+    set_simd_register_by_lane<type>(                           \
+        t, i,                                                  \
+        get_simd_register_by_lane<type>(a, i)                  \
+            op(get_simd_register_by_lane<type>(b, i) & mask)); \
+  }
+    case VSLD: {
+      VECTOR_SHIFT_OP(int64_t, <<, 0x3f)
+      break;
+    }
+    case VSRAD: {
+      VECTOR_SHIFT_OP(int64_t, >>, 0x3f)
+      break;
+    }
+    case VSRD: {
+      VECTOR_SHIFT_OP(uint64_t, >>, 0x3f)
+      break;
+    }
+    case VSLW: {
+      VECTOR_SHIFT_OP(int32_t, <<, 0x1f)
+      break;
+    }
+    case VSRAW: {
+      VECTOR_SHIFT_OP(int32_t, >>, 0x1f)
+      break;
+    }
+    case VSRW: {
+      VECTOR_SHIFT_OP(uint32_t, >>, 0x1f)
+      break;
+    }
+    case VSLH: {
+      VECTOR_SHIFT_OP(int16_t, <<, 0xf)
+      break;
+    }
+    case VSRAH: {
+      VECTOR_SHIFT_OP(int16_t, >>, 0xf)
+      break;
+    }
+    case VSRH: {
+      VECTOR_SHIFT_OP(uint16_t, >>, 0xf)
+      break;
+    }
+    case VSLB: {
+      VECTOR_SHIFT_OP(int8_t, <<, 0x7)
+      break;
+    }
+    case VSRAB: {
+      VECTOR_SHIFT_OP(int8_t, >>, 0x7)
+      break;
+    }
+    case VSRB: {
+      VECTOR_SHIFT_OP(uint8_t, >>, 0x7)
+      break;
+    }
+#undef VECTOR_SHIFT_OP
+#define VECTOR_COMPARE_OP(type_in, type_out, is_fp, op) \
+  VectorCompareOp<type_in, type_out>(                   \
+      this, instr, is_fp, [](type_in a, type_in b) { return a op b; });
+    case XVCMPEQDP: {
+      VECTOR_COMPARE_OP(double, int64_t, true, ==)
+      break;
+    }
+    case XVCMPGEDP: {
+      VECTOR_COMPARE_OP(double, int64_t, true, >=)
+      break;
+    }
+    case XVCMPGTDP: {
+      VECTOR_COMPARE_OP(double, int64_t, true, >)
+      break;
+    }
+    case XVCMPEQSP: {
+      VECTOR_COMPARE_OP(float, int32_t, true, ==)
+      break;
+    }
+    case XVCMPGESP: {
+      VECTOR_COMPARE_OP(float, int32_t, true, >=)
+      break;
+    }
+    case XVCMPGTSP: {
+      VECTOR_COMPARE_OP(float, int32_t, true, >)
+      break;
+    }
+    case VCMPEQUD: {
+      VECTOR_COMPARE_OP(uint64_t, int64_t, false, ==)
+      break;
+    }
+    case VCMPGTSD: {
+      VECTOR_COMPARE_OP(int64_t, int64_t, false, >)
+      break;
+    }
+    case VCMPGTUD: {
+      VECTOR_COMPARE_OP(uint64_t, int64_t, false, >)
+      break;
+    }
+    case VCMPEQUW: {
+      VECTOR_COMPARE_OP(uint32_t, int32_t, false, ==)
+      break;
+    }
+    case VCMPGTSW: {
+      VECTOR_COMPARE_OP(int32_t, int32_t, false, >)
+      break;
+    }
+    case VCMPGTUW: {
+      VECTOR_COMPARE_OP(uint32_t, int32_t, false, >)
+      break;
+    }
+    case VCMPEQUH: {
+      VECTOR_COMPARE_OP(uint16_t, int16_t, false, ==)
+      break;
+    }
+    case VCMPGTSH: {
+      VECTOR_COMPARE_OP(int16_t, int16_t, false, >)
+      break;
+    }
+    case VCMPGTUH: {
+      VECTOR_COMPARE_OP(uint16_t, int16_t, false, >)
+      break;
+    }
+    case VCMPEQUB: {
+      VECTOR_COMPARE_OP(uint8_t, int8_t, false, ==)
+      break;
+    }
+    case VCMPGTSB: {
+      VECTOR_COMPARE_OP(int8_t, int8_t, false, >)
+      break;
+    }
+    case VCMPGTUB: {
+      VECTOR_COMPARE_OP(uint8_t, int8_t, false, >)
+      break;
+    }
+#undef VECTOR_COMPARE_OP
+#undef FOR_EACH_LANE
+#undef DECODE_VX_INSTRUCTION
     default: {
       UNIMPLEMENTED();
       break;

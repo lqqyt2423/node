@@ -491,7 +491,7 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   void AppendDeoptimizeArguments(InstructionOperandVector* args,
                                  DeoptimizeKind kind, DeoptimizeReason reason,
                                  FeedbackSource const& feedback,
-                                 Node* frame_state);
+                                 FrameState frame_state);
 
   void EmitTableSwitch(const SwitchInfo& sw,
                        InstructionOperand const& index_operand);
@@ -561,13 +561,12 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
                             CallBufferFlags flags, bool is_tail_call,
                             int stack_slot_delta = 0);
   bool IsTailCallAddressImmediate();
-  int GetTempsCountForTailCallFromJSFunction();
 
   void UpdateMaxPushedArgumentCount(size_t count);
 
-  FrameStateDescriptor* GetFrameStateDescriptor(Node* node);
+  FrameStateDescriptor* GetFrameStateDescriptor(FrameState node);
   size_t AddInputsToFrameStateDescriptor(FrameStateDescriptor* descriptor,
-                                         Node* state, OperandGenerator* g,
+                                         FrameState state, OperandGenerator* g,
                                          StateObjectDeduplicator* deduplicator,
                                          InstructionOperandVector* inputs,
                                          FrameStateInputKind kind, Zone* zone);
@@ -628,7 +627,7 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   void VisitBranch(Node* input, BasicBlock* tbranch, BasicBlock* fbranch);
   void VisitSwitch(Node* node, const SwitchInfo& sw);
   void VisitDeoptimize(DeoptimizeKind kind, DeoptimizeReason reason,
-                       FeedbackSource const& feedback, Node* frame_state);
+                       FeedbackSource const& feedback, FrameState frame_state);
   void VisitReturn(Node* ret);
   void VisitThrow(Node* node);
   void VisitRetain(Node* node);
@@ -653,6 +652,7 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   // ============= Vector instruction (SIMD) helper fns. =======================
   // ===========================================================================
 
+#if V8_ENABLE_WEBASSEMBLY
   // Canonicalize shuffles to make pattern matching simpler. Returns the shuffle
   // indices, and a boolean indicating if the shuffle is a swizzle (one input).
   void CanonicalizeShuffle(Node* node, uint8_t* shuffle, bool* is_swizzle);
@@ -660,6 +660,7 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   // Swaps the two first input operands of the node, to help match shuffles
   // to specific architectural instructions.
   void SwapShuffleInputs(Node* node);
+#endif  // V8_ENABLE_WEBASSEMBLY
 
   // ===========================================================================
 
